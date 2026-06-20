@@ -1,0 +1,279 @@
+// ============================================================================
+// 1. ESTRUTURAS DE DADOS E INTERFACES (Entidades de Negócio)
+// ============================================================================
+
+interface ItemEstoque {
+    id: string;
+    nome: string;
+    quantidade: number;
+    preco: number;
+    isSazonal: boolean;
+    inicioSazonalidade?: Date;
+    fimSazonalidade?: Date;
+}
+
+interface LojaFranquia {
+    id: string;
+    cidade: string;
+    estoque: Map<string, ItemEstoque>;
+}
+
+interface ItemPedido {
+    produtoId: string;
+    quantidade: number;
+}
+
+interface Pedido {
+    id: string;
+    clienteId: string;
+    lojaId: string;
+    itens: ItemPedido[];
+    valorTotal: number;
+    status: 'Pendente' | 'Pago' | 'Recusado' | 'Erro_Gateway' | 'Pronto_Cozinha';
+    canal: 'App' | 'Totem' | 'Balcao';
+    timestamp: Date;
+}
+
+// ============================================================================
+// 2. SIMULAÇÃO DE INFRAESTRUTURA (Mensageria e Log de Auditoria Imutável)
+// ============================================================================
+
+class ServicoAuditoria {
+    private static logs: string[] = [];
+
+    public static registrarLog(usuario: string, acao: string, detalhes: any): void {
+        const logEntry = JSON.stringify({
+            timestamp: new Date().toISOString(),
+            usuario,
+            acao,
+            detalhes
+        });
+        this.logs.push(logEntry);
+        console.log(`[LOG IMUTÁVEL DE AUDITORIA] -> ${logEntry}`);
+    }
+
+    // RF-007: Bloqueio explícito de deleção de logs
+    public static tentarDeletarLogs(): void {
+        throw new Error("HTTP 403 Forbidden: Ação não permitida. Operação de auditoria gravada de forma imutável.");
+    }
+}
+
+// Fila assíncrona para garantir o desacoplamento (RNF-004)
+class FilaMensageriaPagamento {
+    private fila: Pedido[] = [];
+
+    public enviarParaFila(pedido: Pedido): void {
+        this.fila.push(pedido);
+        console.log(`[FILA] Pedido ${pedido.id} retido na fila assíncrona para processamento.`);
+    }
+
+    public consumir(): Pedido | undefined {
+        return this.fila.shift();
+    }
+
+    public get tamanho(): number {
+        return this.fila.length;
+    }
+}
+
+// ============================================================================
+// 3. MOCK DO GATEWAY DE PAGAMENTO EXTERNO (Para Testes de Resiliência - CT-04)
+// ============================================================================
+
+class GatewayPagamentoExternoMock {
+    private statusSimulado: 'Online' | 'Offline' | 'SaldoInsuficiente' = 'Online';
+
+    public configurarCenarioDeQA(status: 'Online' | 'Offline' | 'SaldoInsuficiente') {
+        this.statusSimulado = status;
+    }
+
+    public async processarTransacao(pedidoId: string, valor: number): Promise<{ sucesso: boolean; mensagem: string; statusHttp: number }> {
+        // Simula latência de rede móvel (RNF-002)
+        await new Promise(resolve => setTimeout(resolve, 500));
+
+        if (this.statusSimulado === 'Offline') {
+            return { sucesso: false, mensagem: "Sistema de pagamentos temporariamente indisponível.", statusHttp: 503 };
+        }
+        if (this.statusSimulado === 'SaldoInsuficiente') {
+            return { sucesso: false, mensagem: "Transação recusada pela operadora por falta de saldo.", statusHttp: 402 };
+        }
+        return { sucesso: true, mensagem: "Pagamento Aprovado com Sucesso.", statusHttp: 200 };
+    }
+}
+
+// ============================================================================
+// 4. MOTOR PRINCIPAL DO SISTEMA (Regras de Negócio da Raízes do Nordeste)
+// ============================================================================
+
+class SistemaRaizesDoNordeste {
+    private lojas: Map<string, LojaFranquia> = new Map();
+    private pedidos: Map<string, Pedido> = new Map();
+    private filaPagamento = new FilaMensageriaPagamento();
+    private gatewayMock = new GatewayPagamentoExternoMock();
+
+    constructor() {
+        this.inicializarDadosDemo();
+    }
+
+    public get GatewayQA() { return this.gatewayMock; }
+
+    // RF-002 e RF-003: Validação rigorosa de estoque local e sazonalidade cronológica
+    public criarPedido(clienteId: string, lojaId: string, canal: 'App' | 'Totem' | 'Balcao', itensDesejados: ItemPedido[]): Pedido {
+        const loja = this.lojas.get(lojaId);
+        if (!loja) throw new Error("HTTP 404: Unidade não encontrada.");
+
+        let valorTotal = 0;
+        const dataAtual = new Date();
+
+        for (const item of itensDesejados) {
+            const produtoEstoque = loja.estoque.get(item.produtoId);
+            
+            if (!produtoEstoque) {
+                throw new Error(`HTTP 404: Produto ${item.produtoId} não comercializado nesta unidade.`);
+            }
+
+            // CT-02: Validação de Estoque Zerado
+            if (produtoEstoque.quantidade < item.quantidade) {
+                throw new Error(`HTTP 422 Unprocessable Entity: Produto ${produtoEstoque.nome} indisponível nesta unidade.`);
+            }
+
+            // CT-08: Validação Cronológica de Sazonalidade (Ex: Período Junino)
+            if (produtoEstoque.isSazonal) {
+                if (produtoEstoque.inicioSazonalidade && dataAtual < produtoEstoque.inicioSazonalidade ||
+                    produtoEstoque.fimSazonalidade && dataAtual > produtoEstoque.fimSazonalidade) {
+                    throw new Error(`HTTP 404 Not Found: Produto ${produtoEstoque.nome} indisponível ou fora de época.`);
+                }
+            }
+
+            valorTotal += produtoEstoque.preco * item.quantidade;
+        }
+
+        // Se passou pelas validações, abate o estoque local imediatamente de forma provisória
+        for (const item of itensDesejados) {
+            const produtoEstoque = loja.estoque.get(item.produtoId)!;
+            produtoEstoque.quantidade -= item.quantidade;
+        }
+
+        const novoPedido: Pedido = {
+            id: `PED-${Math.floor(Math.random() * 90000) + 10000}`,
+            clienteId,
+            lojaId,
+            itens: itensDesejados,
+            valorTotal,
+            status: 'Pendente',
+            canal,
+            timestamp: dataAtual
+        };
+
+        this.pedidos.set(novoPedido.id, novoPedido);
+        
+        // RNF-004: Envia para a fila assíncrona, desacoplando o gateway de pagamento
+        this.filaPagamento.enviarParaFila(novoPedido);
+
+        return novoPedido;
+    }
+
+    // Processador da fila de pagamentos (Simula o Worker assíncrono em Background)
+    public async processarProximoPagamentoDaFila(): Promise<void> {
+        const pedido = this.filaPagamento.consumir();
+        if (!pedido) return;
+
+        console.log(`\n[WORKER] Processando transação financeira do ${pedido.id}...`);
+        
+        const respostaGateway = await this.gatewayMock.processarTransacao(pedido.id, pedido.valorTotal);
+
+        if (respostaGateway.statusHttp === 200) {
+            pedido.status = 'Pago';
+            console.log(`[SUCESSO CT-01] ${pedido.id} aprovado. Enviando para a tela da Cozinha da Loja ${pedido.lojaId}.`);
+            ServicoAuditoria.registrarLog("SISTEMA_ASSINCRONO", "APROVACAO_PAGAMENTO", { pedidoId: pedido.id });
+        } 
+        else if (respostaGateway.statusHttp === 402) {
+            pedido.status = 'Recusado';
+            this.estornarEstoque(pedido);
+            console.log(`[ERRO TRATADO CT-03] ${pedido.id} Recusado: ${respostaGateway.mensagem}`);
+        } 
+        else if (respostaGateway.statusHttp === 503) {
+            pedido.status = 'Erro_Gateway';
+            // Mantém o pedido vivo e avisa o app. Não estorna o estoque imediatamente para permitir nova tentativa do usuário
+            console.log(`[RESILIÊNCIA CT-04] Alerta enviado ao cliente do ${pedido.id}: ${respostaGateway.mensagem}`);
+            ServicoAuditoria.registrarLog("SISTEMA_ASSINCRONO", "FALHA_GATEWAY_RETIDA", { pedidoId: pedido.id, erro: respostaGateway.mensagem });
+        }
+    }
+
+    private estornarEstoque(pedido: Pedido): void {
+        const loja = this.lojas.get(pedido.lojaId)!;
+        for (const item of pedido.itens) {
+            const produto = loja.estoque.get(item.produtoId)!;
+            produto.quantidade += item.quantidade;
+        }
+        console.log(`[ESTOQUE LOCAL] Itens do pedido ${pedido.id} devolvidos ao estoque local.`);
+    }
+
+    private inicializarDadosDemo(): void {
+        // Inicializa Loja Recife com estoque e itens sazonais juninos
+        const estoqueRecife = new Map<string, ItemEstoque>();
+        estoqueRecife.set("PROD01", { id: "PROD01", nome: "Tapioca de Carne de Sol", quantidade: 50, preco: 18.00, isSazonal: false });
+        estoqueRecife.set("PROD02", { id: "PROD02", nome: "Bolo de Macaxeira", quantidade: 1, preco: 8.50, isSazonal: false }); // Estoque baixo para testes
+        
+        // Produto Sazonal Junino (Válido apenas em Junho de 2026)
+        estoqueRecife.set("PROD03", { 
+            id: "PROD03", 
+            nome: "Cuscuz Junino Festivo", 
+            quantidade: 30, 
+            preco: 15.00, 
+            isSazonal: true,
+            inicioSazonalidade: new Date("2026-06-01T00:00:00"),
+            fimSazonalidade: new Date("2026-06-30T23:59:59")
+        });
+
+        this.lojas.set("LOJA_RECIFE", { id: "LOJA_RECIFE", cidade: "Recife", estoque: estoqueRecife });
+    }
+}
+
+// ============================================================================
+// 5. SUÍTE DE SIMULAÇÃO DOS CENÁRIOS DE TESTE DE QUALIDADE (QA EXECUTION)
+// ============================================================================
+
+async function executarSimulacaoQA() {
+    console.log("=== INICIANDO SIMULAÇÃO OPERACIONAL - REDE RAÍZES DO NORDESTE ===\n");
+    const sistema = new SistemaRaizesDoNordeste();
+
+    // ------------------------------------------------------------------------
+    // TESTE 1: Fluxo Positivo Padrão via App (CT-01)
+    // ------------------------------------------------------------------------
+    console.log("--- CENÁRIO 1: Pedido via Aplicativo com Sucesso (CT-01) ---");
+    sistema.GatewayQA.configurarCenarioDeQA('Online');
+    const pedido01 = sistema.criarPedido("CLI_001", "LOJA_RECIFE", "App", [{ produtoId: "PROD01", quantidade: 2 }]);
+    await sistema.processarProximoPagamentoDaFila();
+
+    // ------------------------------------------------------------------------
+    // TESTE 2: Fluxo Negativo - Sem Estoque Local (CT-02)
+    // ------------------------------------------------------------------------
+    console.log("\n--- CENÁRIO 2: Validação de Estoque Local Insuficiente (CT-02) ---");
+    try {
+        sistema.criarPedido("CLI_002", "LOJA_RECIFE", "Totem", [{ produtoId: "PROD02", quantidade: 5 }]);
+    } catch (error: any) {
+        console.log(`[SUCESSO QA] Sistema barrou a compra conforme esperado: ${error.message}`);
+    }
+
+    // ------------------------------------------------------------------------
+    // TESTE 3: Fluxo Negativo - Gateway Offline / Resiliência (CT-04)
+    // ------------------------------------------------------------------------
+    console.log("\n--- CENÁRIO 3: Instabilidade do Gateway de Pagamento Externo (CT-04) ---");
+    sistema.GatewayQA.configurarCenarioDeQA('Offline');
+    const pedido03 = sistema.criarPedido("CLI_003", "LOJA_RECIFE", "Totem", [{ produtoId: "PROD01", quantidade: 1 }]);
+    await sistema.processarProximoPagamentoDaFila();
+
+    // ------------------------------------------------------------------------
+    // TESTE 4: Auditoria de Segurança Imutável (CT-09)
+    // ------------------------------------------------------------------------
+    console.log("\n--- CENÁRIO 4: Teste de Segurança - Tentativa de Fraude em Logs (CT-09) ---");
+    try {
+        ServicoAuditoria.tentarDeletarLogs();
+    } catch (error: any) {
+        console.log(`[SUCESSO QA] Sistema de Segurança bloqueou a invasão: ${error.message}`);
+    }
+}
+
+// Executa a simulação geral
+executarSimulacaoQA();
